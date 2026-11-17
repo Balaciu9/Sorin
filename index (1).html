@@ -1,0 +1,390 @@
+<!DOCTYPE html>
+<html lang="ro">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black">
+<title>Sorin</title>
+<style>
+  * { box-sizing: border-box; -webkit-user-select: none; user-select: none; }
+  html, body { margin: 0; height: 100%; background: #000; color: #fff;
+    font-family: -apple-system, "Helvetica Neue", Arial, sans-serif; overflow: hidden; }
+  #sb-start { position: fixed; inset: 0; display: flex; flex-direction: column;
+    align-items: center; justify-content: center; gap: 24px; padding: 24px; text-align: center; }
+  #sb-start button { font-size: 32px; padding: 20px 48px; border-radius: 16px; border: 0;
+    background: #ffe600; color: #000; font-weight: 800; }
+  #sb-start p { color: #aaa; max-width: 520px; line-height: 1.4; }
+  #sb-board { position: fixed; inset: 0; display: none; }
+  .box { position: absolute; top: 6%; bottom: 16%; border: 6px solid #fff; border-radius: 12px;
+    display: flex; align-items: center; justify-content: center; font-weight: 900;
+    color: #fff; background: #000; transition: background .08s; text-align: center; line-height: 1; }
+  .box.on { background: #ffe600; color: #000; border-color: #ffe600; }
+  #sb-b0 { left: 3%; right: 58%; }  #sb-b1 { left: 58%; right: 3%; }
+  .bar { position: absolute; left: 0; bottom: 0; height: 26px; background: #000; width: 0; }
+  .dot { position: absolute; bottom: 40px; left: 50%; width: 36px; height: 36px; margin-left: -18px;
+    border-radius: 50%; background: #000; display: none; }
+  #sb-center { position: absolute; left: 50%; top: 42%; width: 70px; height: 70px; margin: -35px;
+    border-radius: 50%; background: #ffe600; display: none; }
+  #sb-msg { position: absolute; left: 0; right: 0; bottom: 9%; text-align: center; font-size: 4.2vmin;
+    font-weight: 700; }
+  #sb-answer { position: fixed; inset: 0; display: none; align-items: center; justify-content: center;
+    background: #000; color: #ffe600; font-weight: 900; text-align: center; line-height: 1; }
+  #sb-status { position: absolute; left: 12px; bottom: 54px; font-size: 13px; color: #888; }
+  #sb-status.bad { color: #f55; }
+  #sb-controls { position: absolute; left: 8px; right: 8px; bottom: 8px; display: flex; gap: 8px;
+    flex-wrap: wrap; }
+  #sb-controls button { background: #222; color: #bbb; border: 1px solid #444; border-radius: 8px;
+    font-size: 14px; padding: 8px 12px; }
+  #sb-debug { position: absolute; right: 10px; top: 10px; display: none; font: 12px monospace;
+    color: #5f5; background: rgba(0,0,0,.7); padding: 6px; }
+  #sb-debug canvas { display: block; width: 240px; margin-bottom: 4px; }
+  video { position: absolute; width: 1px; height: 1px; opacity: 0; pointer-events: none; }
+</style>
+</head>
+<body>
+
+<div id="sb-start">
+  <h1>Tabla de comunicare</h1>
+  <button id="sb-go">START</button>
+  <p id="sb-startinfo">Apasati START, permiteti accesul la camera. Prima pornire descarca modelul (cateva MB) – trebuie internet.</p>
+</div>
+
+<div id="sb-board">
+  <div class="box" id="sb-b0"><span class="lab"></span><div class="bar"></div><div class="dot"></div></div>
+  <div class="box" id="sb-b1"><span class="lab"></span><div class="bar"></div><div class="dot"></div></div>
+  <div id="sb-center"></div>
+  <div id="sb-msg"></div>
+  <div id="sb-status"></div>
+  <div id="sb-controls">
+    <button data-k="c">Calibrare</button>
+    <button data-k="m">Mod</button>
+    <button data-k="a">Am intrebat</button>
+    <button data-k="p">Pauza</button>
+    <button data-k="l">Etichete</button>
+    <button data-k="d">Debug</button>
+    <button data-k="s">Salveaza log</button>
+    <button data-k="1">Test 1</button>
+    <button data-k="2">Test 2</button>
+  </div>
+  <div id="sb-debug"><canvas id="sb-dbg" width="240" height="180"></canvas><div id="sb-dbgtxt"></div></div>
+</div>
+<div id="sb-answer"></div>
+<video id="sb-video" playsinline muted autoplay></video>
+
+<script type="module">
+// ============================ SETTINGS ============================
+const LABEL_SETS = [["DA", "NU"], ["DURERE", "ASPIRARE"]];
+const PHRASES = { DA: "Da", NU: "Nu", DURERE: "Mă doare", ASPIRARE: "Am nevoie să fiu aspirat" };
+let MODE = "blink";                 // "blink" or "dwell"
+const DWELL_SECONDS = 2.0;
+const DOUBLE_BLINK_WINDOW = 1.5;    // s between the two blinks
+const BLINK_MAX = 0.8;              // longer closures are ignored (resting eyes)
+const BLINK_CLOSE = 0.45, BLINK_OPEN = 0.28;
+const HEAD_WEIGHT = 1.0;
+const ZONE_FRACTION = 0.5;
+const ZONE_STABLE_SECONDS = 0.3;    // time-based, so it behaves the same at low fps
+const SMOOTHING = 0.45;
+const COOLDOWN = 3.0;
+const RESPONSE_WINDOW = 10.0;
+const CALIB_SECONDS = 3.0;
+const MP_VER = "0.10.14";
+const MODEL_URL = "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task";
+// ==================================================================
+
+import { FaceLandmarker, FilesetResolver } from
+  "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs";
+
+const $ = id => document.getElementById(id);
+const video = $("sb-video");
+const boxes = [$("sb-b0"), $("sb-b1")];
+let labelSet = 0;
+let labels = LABEL_SETS[0];
+
+// ---------------------------------------------------------------- log ---
+const t0 = Date.now();
+const logRows = [["time", "seconds_from_start", "event", "label", "detail"]];
+function log(event, label = "", detail = "") {
+  const d = new Date();
+  const pad = n => String(n).padStart(2, "0");
+  const stamp = `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+  logRows.push([stamp, ((Date.now() - t0) / 1000).toFixed(1), event, label, detail]);
+  try { localStorage.setItem("sorin_log_last", JSON.stringify(logRows)); } catch (e) {}
+}
+function saveLog() {
+  const csv = logRows.map(r => r.map(v => `"${String(v).replace(/"/g, '""')}"`).join(",")).join("\n");
+  const blob = new Blob([csv], { type: "text/csv" });
+  const a = document.createElement("a");
+  const d = new Date();
+  a.href = URL.createObjectURL(blob);
+  a.download = `session_${d.toISOString().slice(0,16).replace(/[-:T]/g, "")}.csv`;
+  document.body.appendChild(a); a.click(); a.remove();
+}
+
+// -------------------------------------------------------------- audio ---
+let roVoice = null;
+function pickVoice() {
+  const vs = speechSynthesis.getVoices();
+  roVoice = vs.find(v => /^ro/i.test(v.lang)) || null;
+}
+if ("speechSynthesis" in window) { pickVoice(); speechSynthesis.onvoiceschanged = pickVoice; }
+function speak(label) {
+  // 1) recorded clip audio/<label>.mp3 next to this page, 2) text-to-speech
+  const a = new Audio(`audio/${label.toLowerCase()}.mp3`);
+  a.onerror = () => tts(PHRASES[label] || label);
+  a.play().catch(() => tts(PHRASES[label] || label));
+}
+function tts(text) {
+  if (!("speechSynthesis" in window)) return;
+  speechSynthesis.cancel();
+  const u = new SpeechSynthesisUtterance(text);
+  u.lang = "ro-RO"; if (roVoice) u.voice = roVoice; u.rate = 0.9;
+  speechSynthesis.speak(u);
+}
+
+// ----------------------------------------------------------- tracking ---
+function proj(p, a, b) {          // position of p along a->b, rotation-invariant
+  const abx = b[0]-a[0], aby = b[1]-a[1], d = abx*abx + aby*aby;
+  return d > 1e-9 ? ((p[0]-a[0])*abx + (p[1]-a[1])*aby) / d : 0.5;
+}
+function readFace(res, w, h) {
+  if (!res.faceLandmarks || !res.faceLandmarks.length) return null;
+  const lm = res.faceLandmarks[0];
+  const P = i => [lm[i].x * w, lm[i].y * h];
+  const r1 = proj(P(468), P(33), P(133));
+  const r2 = proj(P(473), P(362), P(263));
+  const eye = (r1 + r2) / 2 - 0.5;
+  const head = proj(P(1), P(234), P(454)) - 0.5;
+  let blink = 0;
+  if (res.faceBlendshapes && res.faceBlendshapes.length) {
+    const c = res.faceBlendshapes[0].categories;
+    const g = n => (c.find(x => x.categoryName === n) || { score: 0 }).score;
+    blink = (g("eyeBlinkLeft") + g("eyeBlinkRight")) / 2;
+  }
+  return { metric: eye + HEAD_WEIGHT * head, blink };
+}
+
+const blinkDet = {
+  closed: false, tClose: 0, last: null,
+  reset() { this.closed = false; this.last = null; },
+  update(s, t) {
+    if (!this.closed && s > BLINK_CLOSE) { this.closed = true; this.tClose = t; return null; }
+    if (this.closed && s < BLINK_OPEN) {
+      this.closed = false;
+      const dur = t - this.tClose;
+      if (dur <= BLINK_MAX) {
+        if (this.last !== null && t - this.last <= DOUBLE_BLINK_WINDOW) { this.last = null; return "double"; }
+        this.last = t; return "blink";
+      }
+      this.last = null; return "long";
+    }
+    if (this.last !== null && t - this.last > DOUBLE_BLINK_WINDOW) this.last = null;
+    return null;
+  },
+  get waiting() { return this.last !== null; }
+};
+
+let calib = { center: null, left: null, right: null };
+const calibOk = () => calib.center !== null && calib.left !== null && calib.right !== null;
+function zoneOf(m) {
+  if (!calibOk()) return null;
+  const d = m - calib.center;
+  const sides = [calib.left - calib.center, calib.right - calib.center];
+  for (let z = 0; z < 2; z++)
+    if (sides[z] * d > 0 && Math.abs(d) >= ZONE_FRACTION * Math.abs(sides[z])) return z;
+  return null;
+}
+
+// -------------------------------------------------------------- state ---
+let landmarker, lastVideoTime = -1;
+let smooth = null, stableZone = null, candZone = null, candSince = 0, armedZone = null;
+let dwellZone = null, dwellStart = 0, needRelease = false;
+let shownUntil = 0, questionT = null, paused = false, debug = false;
+let faceOk = false, faceLostSince = performance.now() / 1000, faceLostLogged = false;
+let fps = 0, lastFrame = performance.now() / 1000;
+let calibrating = true, stepI = 0, stepT0 = 0, samples = [];
+const steps = () => [["center", "Priviti la CENTRU"], ["left", `Priviti la ${labels[0]}`], ["right", `Priviti la ${labels[1]}`]];
+
+function fitText(el, box, frac = 0.8) {
+  const w = box.clientWidth * frac, h = box.clientHeight * 0.4;
+  el.style.fontSize = Math.min(h, w / Math.max(1, el.textContent.length * 0.68)) + "px";
+}
+function setLabels() {
+  boxes.forEach((b, i) => { const l = b.querySelector(".lab"); l.textContent = labels[i]; fitText(l, b); });
+}
+window.addEventListener("resize", setLabels);
+
+function startCalibration() {
+  calibrating = true; stepI = 0; stepT0 = performance.now() / 1000; samples = [];
+  calib = { center: null, left: null, right: null };
+  stableZone = armedZone = dwellZone = null; smooth = null;
+}
+
+function select(i, how) {
+  let detail = how;
+  if (questionT !== null) { detail += ` response_time=${(performance.now()/1000 - questionT).toFixed(1)}s`; questionT = null; }
+  log("selection", labels[i], detail);
+  speak(labels[i]);
+  const ans = $("sb-answer");
+  ans.textContent = labels[i];
+  ans.style.fontSize = Math.min(innerHeight * 0.45, innerWidth * 0.85 / (labels[i].length * 0.68)) + "px";
+  ans.style.display = "flex";
+  shownUntil = performance.now() / 1000 + COOLDOWN;
+  armedZone = null; needRelease = true; blinkDet.reset();
+}
+
+// --------------------------------------------------------------- loop ---
+function frame() {
+  requestAnimationFrame(frame);
+  if (video.readyState < 2 || video.currentTime === lastVideoTime) return;
+  lastVideoTime = video.currentTime;
+  const now = performance.now() / 1000;
+  const dt = now - lastFrame; lastFrame = now;
+  fps = 0.9 * fps + 0.1 * (dt > 0 ? 1 / dt : 0);
+
+  const res = landmarker.detectForVideo(video, performance.now());
+  const face = readFace(res, video.videoWidth, video.videoHeight);
+
+  if (!face) {
+    if (faceOk) faceLostSince = now;
+    faceOk = false;
+    if (!faceLostLogged && now - faceLostSince > 2) { log("face_lost"); faceLostLogged = true; }
+    stableZone = null; candZone = null; armedZone = null; blinkDet.reset();
+  } else {
+    if (faceLostLogged) { log("face_found"); faceLostLogged = false; }
+    faceOk = true;
+  }
+
+  const cdot = $("sb-center"), msg = $("sb-msg");
+  if (now >= shownUntil) $("sb-answer").style.display = "none";
+
+  if (calibrating) {
+    const [name, text] = steps()[stepI];
+    const el = now - stepT0;
+    if (face && el > 1.0 && face.blink < BLINK_OPEN) samples.push(face.metric);
+    cdot.style.display = name === "center" ? "block" : "none";
+    boxes[0].style.visibility = name === "left" ? "visible" : "hidden";
+    boxes[1].style.visibility = name === "right" ? "visible" : "hidden";
+    boxes.forEach(b => b.classList.add("on"));
+    msg.textContent = text;
+    $("sb-status").textContent = `calibrare ${stepI + 1}/3  ${Math.max(0, CALIB_SECONDS - el).toFixed(0)}s  ${face ? "fata OK" : "NU VAD FATA"}  ${fps.toFixed(1)} fps`;
+    $("sb-status").className = face ? "" : "bad";
+    if (el >= CALIB_SECONDS) {
+      if (samples.length < 5) { stepT0 = now; samples = []; }
+      else {
+        const s = samples.slice().sort((a, b) => a - b);
+        calib[name] = s[Math.floor(s.length / 2)];
+        stepI++; stepT0 = now; samples = [];
+        if (stepI === 3) {
+          const spread = Math.abs(calib.right - calib.left);
+          if (spread < 0.04) { log("calibration_failed", "", `spread=${spread.toFixed(3)}`); startCalibration(); }
+          else {
+            log("calibration_ok", "", `center=${calib.center.toFixed(3)} left=${calib.left.toFixed(3)} right=${calib.right.toFixed(3)}`);
+            calibrating = false; cdot.style.display = "none"; msg.textContent = "";
+            boxes.forEach(b => { b.style.visibility = "visible"; b.classList.remove("on"); });
+          }
+        }
+      }
+    }
+  } else if (!paused) {
+    let ev = null;
+    if (face) {
+      ev = blinkDet.update(face.blink, now);
+      if (!blinkDet.closed) {
+        smooth = smooth === null ? face.metric : SMOOTHING * face.metric + (1 - SMOOTHING) * smooth;
+        const z = zoneOf(smooth);
+        if (z !== candZone) { candZone = z; candSince = now; }
+        if (now - candSince >= ZONE_STABLE_SECONDS) stableZone = candZone;
+      }
+      if (stableZone === null) needRelease = false;
+      if (now >= shownUntil) {
+        if (MODE === "blink") {
+          if (ev === "blink") armedZone = stableZone;
+          else if (ev === "double") { if (armedZone !== null) select(armedZone, "double_blink"); else log("double_blink_no_box"); }
+          else if (ev === "long") armedZone = null;
+          if (!blinkDet.waiting && !blinkDet.closed) armedZone = null;
+        } else {
+          if (stableZone === null || needRelease) dwellZone = null;
+          else if (stableZone !== dwellZone) { dwellZone = stableZone; dwellStart = now; }
+          else if (now - dwellStart >= DWELL_SECONDS) { select(dwellZone, "dwell"); dwellZone = null; }
+        }
+      }
+    }
+    if (questionT !== null && now - questionT > RESPONSE_WINDOW) { log("no_response", "", `window=${RESPONSE_WINDOW}s`); questionT = null; }
+
+    boxes.forEach((b, i) => {
+      b.classList.toggle("on", i === stableZone);
+      const prog = MODE === "dwell" && dwellZone === i ? Math.min(1, (now - dwellStart) / DWELL_SECONDS) : 0;
+      b.querySelector(".bar").style.width = (prog * 100) + "%";
+      b.querySelector(".dot").style.display = (MODE === "blink" && i === armedZone && blinkDet.waiting) ? "block" : "none";
+    });
+    let st = `mod: ${MODE === "blink" ? "clipire dubla" : "privire fixa"}  ${face ? "fata OK" : "NU VAD FATA"}  ${fps.toFixed(1)} fps`;
+    if (questionT !== null) st += `  intrebare: ${(now - questionT).toFixed(1)}s`;
+    $("sb-status").textContent = st; $("sb-status").className = face ? "" : "bad";
+  } else {
+    boxes.forEach(b => b.classList.remove("on"));
+    $("sb-status").textContent = "[PAUZA]";
+  }
+
+  if (debug) {
+    const c = $("sb-dbg").getContext("2d");
+    c.drawImage(video, 0, 0, 240, 180);
+    if (res.faceLandmarks && res.faceLandmarks.length) {
+      c.fillStyle = "#5f5";
+      for (const i of [468, 473, 33, 133, 362, 263, 1]) {
+        const p = res.faceLandmarks[0][i]; c.fillRect(p.x * 240 - 2, p.y * 180 - 2, 4, 4);
+      }
+    }
+    const f = v => v === null ? "-" : v.toFixed(3);
+    $("sb-dbgtxt").innerHTML = face
+      ? `gaze ${f(face.metric)} smooth ${f(smooth)}<br>blink ${face.blink.toFixed(2)} (close>${BLINK_CLOSE})<br>` +
+        `calib L ${f(calib.left)} C ${f(calib.center)} R ${f(calib.right)}<br>zone ${stableZone} armed ${armedZone}`
+      : "no face";
+  }
+}
+
+// ----------------------------------------------------------- controls ---
+function key(k) {
+  if (k === "c") { startCalibration(); log("recalibrate"); }
+  else if (k === "m") { MODE = MODE === "blink" ? "dwell" : "blink"; armedZone = dwellZone = null; log("mode", "", MODE); }
+  else if (k === "a") { questionT = performance.now() / 1000; log("question_asked"); }
+  else if (k === "p") { paused = !paused; log(paused ? "pause" : "resume"); }
+  else if (k === "l") { labelSet = (labelSet + 1) % LABEL_SETS.length; labels = LABEL_SETS[labelSet]; setLabels(); log("labels", "", labels.join("/")); }
+  else if (k === "d") { debug = !debug; $("sb-debug").style.display = debug ? "block" : "none"; }
+  else if (k === "s") saveLog();
+  else if ((k === "1" || k === "2") && !calibrating) select(k === "1" ? 0 : 1, "manual");
+}
+document.querySelectorAll("#sb-controls button").forEach(b =>
+  b.addEventListener("click", e => { e.stopPropagation(); key(b.dataset.k); }));
+document.addEventListener("keydown", e => key(e.key.toLowerCase()));
+
+// -------------------------------------------------------------- start ---
+$("sb-go").addEventListener("click", async () => {
+  const info = $("sb-startinfo");
+  try {
+    tts(" ");   // unlocks speech on iOS (must happen inside a tap)
+    info.textContent = "Pornesc camera...";
+    const stream = await navigator.mediaDevices.getUserMedia({
+      video: { facingMode: "user", width: { ideal: 640 }, height: { ideal: 480 } }, audio: false });
+    video.srcObject = stream; await video.play();
+    info.textContent = "Incarc modelul...";
+    const files = await FilesetResolver.forVisionTasks(`https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@${MP_VER}/wasm`);
+    const opts = d => ({ baseOptions: { modelAssetPath: MODEL_URL, delegate: d }, runningMode: "VIDEO",
+      numFaces: 1, outputFaceBlendshapes: true, minFaceDetectionConfidence: 0.4, minTrackingConfidence: 0.4 });
+    try { landmarker = await FaceLandmarker.createFromOptions(files, opts("GPU")); }
+    catch (e) { landmarker = await FaceLandmarker.createFromOptions(files, opts("CPU")); }
+    const el = document.documentElement;
+    try { (el.requestFullscreen || el.webkitRequestFullscreen).call(el); } catch (e) {}
+    $("sb-start").style.display = "none"; $("sb-board").style.display = "block";
+    setLabels();
+    log("session_start", "", `labels=${labels.join("/")} mode=${MODE} ua=${navigator.userAgent}`);
+    startCalibration();
+    requestAnimationFrame(frame);
+  } catch (e) {
+    info.textContent = "Eroare: " + (e && e.message ? e.message : e) +
+      " — pagina trebuie deschisa prin https, iar accesul la camera permis.";
+  }
+});
+</script>
+</body>
+</html>
